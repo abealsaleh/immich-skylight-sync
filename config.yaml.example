@@ -1,0 +1,22 @@
+# Immich to Skylight Sync Configuration
+
+immich:
+  url: "http://192.168.1.x:2283"  # Your Immich server URL
+  # Generate API key from Immich: Account Settings > API Keys > New API Key
+  # Required permissions (READ-ONLY): album:read, asset:read, asset:download
+  # Do NOT grant any write/delete permissions - they are not needed
+  api_key: "your-immich-api-key"
+  albums:                           # List of albums to sync (by name)
+    - "Family Favorites"
+    - "Vacation 2024"
+    - "Kids Photos"
+
+skylight:
+  email: "your-skylight-email@example.com"
+  password: "your-skylight-password"
+  frame_id: "123456"  # From URL: app.ourskylight.com/frames/{frame_id}/messages
+
+sync:
+  interval_minutes: 60    # How often to sync (default: 60)
+  delete_removed: true    # Remove photos no longer in selected Immich albums
+  dry_run: false          # Set to true to preview changes without applying them
