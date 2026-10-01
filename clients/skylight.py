@@ -3,23 +3,44 @@
 This client interacts with the Skylight web portal at app.ourskylight.com.
 API endpoints reverse-engineered from the mobile app.
 
-Authentication flow:
-1. POST /api/sessions with email/password
-2. Response contains user_id and token (atu_...)
-3. Subsequent requests use Basic auth: base64(user_id:token)
+Authentication flow (OAuth2 Authorization-Code + PKCE, as used by the current apps;
+the legacy POST /api/sessions endpoint is retired):
+1. GET /oauth/authorize -> web login form carrying a CSRF authenticity_token
+2. POST /auth/session with email/password -> redirects to skylight-family://welcome?code=...
+3. POST /oauth/token with the code + PKCE verifier -> access_token / refresh_token
+4. Subsequent requests use "Authorization: Bearer <access_token>"
 """
 
 import base64
+import hashlib
 import logging
+import re
+import secrets
 import time
 import uuid
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
 from models import SkylightPhoto
 
 logger = logging.getLogger(__name__)
+
+OAUTH_CLIENT_ID = "skylight-mobile"
+OAUTH_SCOPE = "everything"
+OAUTH_REDIRECT_URI = "skylight-family://welcome"
+# The OAuth login pages are served to browsers; present a browser UA there.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_CSRF_RE = re.compile(r'name="authenticity_token"[^>]*value="([^"]+)"')
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
 class SkylightError(Exception):
@@ -62,26 +83,34 @@ class SkylightClient:
         self.session = requests.Session()
 
         # Will be set after login
-        self.user_id: Optional[str] = None
-        self.token: Optional[str] = None
-        self._authenticated = False
+        self.access_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.expires_at: Optional[float] = None
 
-        # Set default headers matching the mobile app
         self.session.headers.update(
             {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "SkylightMobile/1.95.2 (python-sync)",
             }
         )
 
-    def _get_basic_auth_header(self) -> str:
-        """Generate Basic Auth header value."""
-        if not self.user_id or not self.token:
-            raise SkylightAuthError("Not authenticated - call login() first")
-        credentials = f"{self.user_id}:{self.token}"
-        encoded = base64.b64encode(credentials.encode()).decode()
-        return f"Basic {encoded}"
+    def _token_valid(self) -> bool:
+        """True if we hold an access token that isn't about to expire."""
+        if not self.access_token:
+            return False
+        return self.expires_at is None or time.time() < self.expires_at - 60
+
+    def _ensure_token(self) -> None:
+        """Make sure we have a usable access token (refresh, else full login)."""
+        if self._token_valid():
+            return
+        if self.refresh_token:
+            try:
+                self._refresh()
+                return
+            except SkylightError as e:
+                logger.warning(f"Token refresh failed, logging in again: {e}")
+        self.login()
 
     def _request(
         self,
@@ -94,16 +123,21 @@ class SkylightClient:
         url = f"{self.BASE_URL}{endpoint}"
         kwargs.setdefault("timeout", self.timeout)
 
-        if authenticate:
-            if not self._authenticated:
-                self.login()
-            self.session.headers["Authorization"] = self._get_basic_auth_header()
-
         try:
+            if authenticate:
+                self._ensure_token()
+                self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
             response = self.session.request(method, url, **kwargs)
 
+            # Token may have been revoked server-side: log in again once and retry
+            if response.status_code == 401 and authenticate:
+                self.login()
+                self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                response = self.session.request(method, url, **kwargs)
+
             if response.status_code == 401:
-                raise SkylightAuthError("Authentication failed - check credentials")
+                raise SkylightAuthError(f"Authentication failed: {response.text}")
 
             response.raise_for_status()
             return response
@@ -117,43 +151,132 @@ class SkylightClient:
             logger.error(f"Skylight request error: {e}")
             raise SkylightError(f"Request failed: {e}") from e
 
+    def _store_token(self, payload: dict) -> None:
+        """Store tokens from an /oauth/token response."""
+        if not payload.get("access_token"):
+            raise SkylightAuthError("Token response did not contain an access_token")
+        self.access_token = payload["access_token"]
+        self.refresh_token = payload.get("refresh_token") or self.refresh_token
+        created = payload.get("created_at")
+        expires_in = payload.get("expires_in")
+        if isinstance(created, (int, float)) and isinstance(expires_in, (int, float)):
+            self.expires_at = float(created) + float(expires_in)
+        else:
+            self.expires_at = None
+
+    def _token_request(self, data: dict) -> None:
+        """POST to /oauth/token and store the resulting tokens."""
+        response = requests.post(
+            f"{self.BASE_URL}/oauth/token",
+            data={"client_id": OAUTH_CLIENT_ID, **data},
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+            timeout=self.timeout,
+        )
+        if response.status_code >= 400:
+            raise SkylightAuthError(
+                f"Token request failed: {response.status_code} - {response.text}"
+            )
+        self._store_token(response.json())
+
+    def _refresh(self) -> None:
+        """Exchange the refresh token for a new access token."""
+        self._token_request(
+            {"grant_type": "refresh_token", "refresh_token": self.refresh_token}
+        )
+        logger.info("Refreshed Skylight access token")
+
     def login(self) -> bool:
         """
-        Authenticate with Skylight.
-
-        POST /api/sessions with email/password returns user_id and token.
+        Authenticate with Skylight via OAuth2 Authorization-Code + PKCE.
 
         Returns:
             True if authentication successful
         """
+        self.access_token = self.refresh_token = self.expires_at = None
+        verifier = _b64url(secrets.token_bytes(32))
+        challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+        state = _b64url(secrets.token_bytes(18))
+
+        # Separate session: the login pages use their own cookies and browser UA
+        web = requests.Session()
+        web.headers["User-Agent"] = BROWSER_UA
+
+        def get(location: str) -> requests.Response:
+            url = location if location.startswith("http") else self.BASE_URL + location
+            return web.get(url, allow_redirects=False, timeout=self.timeout)
+
         try:
-            response = self.session.post(
-                f"{self.BASE_URL}/api/sessions",
-                json={"email": self.email, "password": self.password},
+            # Step 1: load the login form (follow redirects manually)
+            response = web.get(
+                f"{self.BASE_URL}/oauth/authorize",
+                params={
+                    "response_type": "code",
+                    "client_id": OAUTH_CLIENT_ID,
+                    "redirect_uri": OAUTH_REDIRECT_URI,
+                    "scope": OAUTH_SCOPE,
+                    "state": state,
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "prompt": "login",
+                },
+                allow_redirects=False,
                 timeout=self.timeout,
             )
+            for _ in range(10):
+                if response.status_code not in _REDIRECT_CODES:
+                    break
+                response = get(response.headers["location"])
 
-            if response.status_code == 401:
+            csrf = _CSRF_RE.search(response.text)
+            if not csrf:
+                raise SkylightAuthError(
+                    f"Could not load login form (HTTP {response.status_code}, no CSRF token)"
+                )
+
+            # Step 2: submit credentials, chase redirects to skylight-family://welcome
+            response = web.post(
+                f"{self.BASE_URL}/auth/session",
+                data={
+                    "authenticity_token": csrf.group(1),
+                    "email": self.email,
+                    "password": self.password,
+                },
+                allow_redirects=False,
+                timeout=self.timeout,
+            )
+            location = response.headers.get("location")
+            for _ in range(8):
+                if not location or location.startswith("skylight-family:"):
+                    break
+                location = get(location).headers.get("location")
+
+            if not (location and location.startswith("skylight-family:")):
                 raise SkylightAuthError("Invalid email or password")
 
-            response.raise_for_status()
-            data = response.json()
+            query = parse_qs(urlparse(location).query)
+            if query.get("state", [""])[0] != state:
+                raise SkylightAuthError("OAuth state mismatch")
+            code = query.get("code", [""])[0]
+            if not code:
+                raise SkylightAuthError("OAuth authorization code missing")
 
-            # Extract user_id and token from response
-            # {"data": {"id": "123", "attributes": {"token": "atu_..."}}}
-            self.user_id = data["data"]["id"]
-            self.token = data["data"]["attributes"]["token"]
-            self._authenticated = True
+            # Step 3: exchange the code for tokens
+            self._token_request(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": OAUTH_REDIRECT_URI,
+                    "code_verifier": verifier,
+                }
+            )
 
-            logger.info(f"Successfully authenticated as user {self.user_id}")
+            logger.info("Successfully authenticated with Skylight")
             return True
 
         except SkylightAuthError:
-            self._authenticated = False
             raise
         except Exception as e:
             logger.error(f"Login failed: {e}")
-            self._authenticated = False
             raise SkylightAuthError(f"Login failed: {e}") from e
 
     def list_photos(
@@ -351,5 +474,6 @@ class SkylightClient:
         try:
             self.login()
             return True
-        except (SkylightError, SkylightAuthError):
+        except SkylightError as e:
+            logger.error(f"Skylight connection check failed: {e}")
             return False
